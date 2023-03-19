@@ -1,0 +1,256 @@
+### General ###
+import os
+import warnings
+import numpy as np
+import pandas as pd
+from datetime import datetime,timedelta
+### 插值 ###
+from metpy.interpolate import inverse_distance_to_grid
+### Visualization ###
+import matplotlib.pyplot as plt
+import numpy as np
+#import netCDF4 as nc
+from matplotlib.font_manager import FontProperties
+from cartopy.mpl.ticker import LongitudeFormatter, LatitudeFormatter
+from cartopy.mpl.gridliner import LONGITUDE_FORMATTER, LATITUDE_FORMATTER
+import matplotlib.ticker as mticker
+import matplotlib as mpl
+import cartopy.crs as ccrs
+import cartopy.feature as cfeat
+#from wrf import getvar, to_np
+import cmaps
+from colorama import Fore
+### Machine Learning ###
+import xgboost as xgb
+from sklearn.metrics import make_scorer
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import KFold, cross_val_score
+from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
+### Optimization ###
+import optuna
+######################
+
+### 数据处理 ###
+def get_ec_info(file_date, time_window = time_window, file_path = file_path):
+    file_date = start_time
+
+    file_date_str = str(file_date.year)[2:]+str(file_date.month)+str(file_date.day)
+    _features = [_f+'/'+_l+'/' for _f in high_altitude_features for _l in high_altitude_levels]
+    #_feature_name = [i.replace('/', '_') for i in _features]
+
+    _files = []
+    _feature_name_list = []
+    _forcast_time = []
+    for _i in ['08','20']:
+        ec_start_time = file_date + timedelta(hours = int(_i))
+        for _f in _features:
+            for _t in time_window:
+                _t = str(_t)
+                if len(_t) == 1:
+                    _t = '00' + _t
+                if len(_t) == 2:
+                    _t = '0' + _t
+                else:
+                    _t = _t
+
+                ec_forcast_time = str(ec_start_time + timedelta(hours = int(_t)))
+                _forcast_time.append(ec_forcast_time)
+
+                file_name = file_path + _f + file_date_str + _i + '.' + _t
+                _files.append(file_name)
+                _feature_name = (_f + _i + '/' + _t).replace('/', '_')
+                _feature_name_list.append(_feature_name)
+
+    file_info_dict = dict({'file_names': _files,
+                           'feature_names': np.array(_feature_name_list).flatten().tolist(),
+                           'forcast_times': _forcast_time
+                           })
+
+    return file_info_dict
+
+def ec_2d_data_to_df(_ec_data, scope = {'lon': [116,128.5], 'lat': [36,46], 'res':[0.25]}):
+    _ec_data = _ec_data[::-1]
+
+    _ec_data_filt = _ec_data.loc[min(scope['lat']): max(scope['lat']), min(scope['lon']):max(scope['lon'])]
+    
+    _ec_data_df = pd.DataFrame(columns = ['lon', 'lat', 'value'])
+    _ec_data_df['lon'] = list(_ec_data_filt.columns) * _ec_data_filt.shape[0]
+    _ec_data_df['lat'] = list(np.repeat(_ec_data_filt.index, _ec_data_filt.shape[1]))
+    _ec_data_df['value'] = _ec_data_filt.values.reshape(_ec_data_filt.shape[0]*_ec_data_filt.shape[1],1)
+    
+    return _ec_data_df
+
+def file_exam(ec_file):
+    _n = 0
+    while _n < 100:
+        _tmp = pd.read_csv(ec_file, header = None).iloc[_n][0]
+        if len(_tmp) < 100:
+            _n += 1
+        else:
+            _skiprows = _n
+            _n = 101
+    return _skiprows
+
+def get_ec_data(ec_file):
+    _skiprows = file_exam(ec_file)
+    
+    file_info = pd.read_csv(ec_file, header = None).iloc[2][0]
+    file_info_list = file_info.split(' ')
+    lon_res = float(file_info_list[0])
+    lat_res = float(file_info_list[1])
+    lon_min = float(file_info_list[2])
+    lon_max = float(file_info_list[3])
+    #lat是倒序
+    lat_min = float(file_info_list[5])
+    lat_max = float(file_info_list[4])
+    
+    ec_high_lon = np.arange(lon_min, lon_max + lon_res, lon_res)
+    ec_high_lat = np.arange(lat_max, lat_min + lat_res, lat_res)
+    
+    ec_df = pd.read_csv(ec_file, header = None, skiprows = _skiprows, sep = '\s+' )
+    
+    special_features = ['10uv', 'uv']
+    current_f = ec_file.split('/')[5]
+    if current_f in special_features:
+        ec_df.columns = ec_high_lon
+        ec_df.index = np.array(ec_high_lat.tolist() * 2).flatten()
+        ec_df_u = ec_df.iloc[:len(ec_high_lat),:]
+        ec_df_v = ec_df.iloc[len(ec_high_lat):,:]
+
+        ec_u = ec_2d_data_to_df(ec_df_u)
+        ec_v = ec_2d_data_to_df(ec_df_v)
+
+        ec_wind = pd.merge(ec_u, ec_v, left_on = ['lon', 'lat'], right_on = ['lon', 'lat'], how = 'inner')
+        ec_wind['value'] = np.sqrt(ec_wind['value_x'] ** 2 + ec_wind['value_y'] ** 2)
+        ec_df_cor = ec_wind.loc[:,['lon', 'lat', 'value']]
+    else:
+        ec_df.columns = ec_high_lon
+        ec_df.index = ec_high_lat
+        ec_df_cor = ec_2d_data_to_df(ec_df)
+    
+    return ec_df_cor
+
+#cressman 插值
+def cressman_interpolate(from_lon, from_lat, from_data, to_lon, to_lat, r):
+    _lon_grid = to_lon
+    _lat_grid = to_lat
+    
+    _lon_gridmesh, _lat_gridmesh = np.meshgrid(_lon_grid, _lat_grid)
+    
+    #插值tm数据
+    #lon,lat, 插值前的经纬度坐标 
+    #lon_gridmesh,lat_gridmesh, 插值后的经纬度坐标
+    #r = 2 搜索半径内的站点数
+    #min_neighbors=3 最小插值点数
+    
+    _grid_data = inverse_distance_to_grid(from_lon, from_lat, from_data
+                                         ,_lon_gridmesh, _lat_gridmesh
+                                         ,r, min_neighbors = 3)
+    return _grid_data
+######################
+
+### Model Training ###
+def smape(y_true, y_pred):
+    smap = np.zeros(len(y_true))
+    
+    num = np.abs(y_true - y_pred)
+    dem = ((np.abs(y_true) + np.abs(y_pred)) / 2)
+    
+    pos_ind = (y_true!=0)|(y_pred!=0)
+    smap[pos_ind] = num[pos_ind] / dem[pos_ind]
+    
+    return 100 * np.mean(smap)
+######################
+
+### Data Visualization ###
+def data_vis(data, lon_scope, lat_scope, _res, color_scope = np.arange(-20, -10, 1)):
+    _lon_min = lon_scope[0]
+    _lon_max = lon_scope[1]
+    _lat_min = lat_scope[0]
+    _lat_max = lat_scope[1]
+    
+    # mpl.rcParams['axes.unicode_minus']=False
+    fig = plt.figure(figsize=(20, 10), dpi=150)
+    axe = plt.subplot(1, 1, 1, projection=ccrs.PlateCarree())
+    axe.set_title('Temperature', fontsize=12, y=1)
+    axe.add_feature(cfeat.COASTLINE.with_scale('10m'), linewidth=1, color='k')
+    LAKES_border = cfeat.NaturalEarthFeature('physical', 'lakes', '10m', edgecolor='k', facecolor='never')
+    axe.add_feature(LAKES_border, linewidth = 0.8)
+    # axe.set_extent([69.75,140, 9.75, 60], crs = ccrs.PlateCarree())
+    gl = axe.gridlines(crs = ccrs.PlateCarree(), draw_labels = True, linewidth = 0.8, color = 'gray', linestyle = ':')
+    gl.top_labels, gl.bottom_labels, gl.right_labels, gl.left_labels = False, False, False, False
+
+    gl.xlocator = mticker.FixedLocator(np.arange(_lon_min, _lon_max+0.5, 0.5))
+    gl.ylocator = mticker.FixedLocator(np.arange(_lat_min, _lat_min+0.5, 0.5))
+
+    axe.set_xticks(np.arange(_lon_min, _lon_max+0.5, 0.5), crs = ccrs.PlateCarree())
+    axe.set_yticks(np.arange(_lat_min, _lat_min+0.5, 0.5), crs = ccrs.PlateCarree())
+
+    axe.xaxis.set_major_formatter(LongitudeFormatter())
+    axe.yaxis.set_major_formatter(LatitudeFormatter())
+    axe.tick_params(labelcolor = 'k', length = 2)
+    labels = axe.get_xticklabels() + axe.get_yticklabels()
+    [label.set_fontproperties(FontProperties(size = 8)) for label in labels]
+
+    _lon = np.arange(_lon_min, _lon_max + _res, _res)
+    _lat = np.arange(_lat_min, _lat_max + _res, _res)
+
+    contourf = axe.contourf(_lon, _lat, data, levels = color_scope, cmap = cmaps.NCV_jaisnd, extend='both')
+
+    fig.subplots_adjust(right = 0.7)
+    rect = [0.78, 0.25, 0.01, 0.5]
+    cbar_ax = fig.add_axes(rect)
+    cb = fig.colorbar(contourf, drawedges=True, ticks = color_scope, cax=cbar_ax, orientation='vertical', spacing='uniform')
+    cb.set_label('Temperature', fontsize=12)
+    cb.ax.tick_params(length = 0)
+    labels = cb.ax.get_xticklabels() + cb.ax.get_yticklabels()
+    plt.show()
+
+### 读取EC数据 ###
+#预报范围 Lon: 116-128.5; Lat: 36-46;0.05度
+#预报时效：前72h逐3h，72-240h逐6h
+#EC数据范围69.750 140.000 60.000 9.750
+### 读取EC数据 ###
+file_path = '/Users/wudi/Downloads/ECMWF_HR/'
+
+#预报范围 Lon: 116-128.5; Lat: 36-46;0.05度
+#预报时效：前72h逐3h，72-240h逐6h
+#EC数据范围69.750 140.000 60.000 9.750
+
+high_altitude_features = ['Q','R','T','uv']
+high_altitude_res = 0.25
+high_altitude_levels = ['850','700','500']
+surface_features = ['2T','10uv','100uv','CAPE','TCC','tcw']
+surface_res = 0.125
+
+forcast_start_time = ['08', '20']
+time_window = [i for i in range(6, 72+6, 6)]
+
+start_time = datetime(2019,12,31)
+end_time = datetime(2019,12,31)
+next_time = start_time
+
+forcast_lon = np.arange(116, 128.5+0.05, 0.05)
+forcast_lat = np.arange(36, 46+0.05, 0.05)
+forcast_lon_grid, forcast_lat_grid = np.meshgrid(forcast_lon, forcast_lat)
+
+train_df_day = pd.DataFrame({'lon': forcast_lon_grid.flatten()
+                            ,'lat': forcast_lat_grid.flatten()})
+train_df = pd.DataFrame()
+train_df_vol = len(forcast_lon) * len(forcast_lat)
+
+while next_time <= end_time:
+    ec_info_dict = get_ec_info(file_date = start_time, time_window = time_window, file_path = file_path)
+    for i in range(0, len(ec_info_dict['file_names'])):
+        print('reading file:', ec_info_dict['file_names'][i])
+        ec_df = get_ec_data(ec_info_dict['file_names'][i])
+        current_f = ec_info_dict['feature_names'][i]
+        train_df_day.loc[:,'time'] = ec_info_dict['forcast_times'][i]
+        
+        grid_data = cressman_interpolate(ec_df['lon'].values, ec_df['lat'].values, ec_df['value'].values
+                                        ,to_lon = forcast_lon, to_lat = forcast_lat, r = 2)
+        train_df_day[current_f] = grid_data.flatten()
+        
+    train_df = pd.concat([train_df, train_df_day], axis = 0)
+    next_time = start_time +timedelta(days = 1)
