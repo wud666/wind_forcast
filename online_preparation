@@ -1,0 +1,303 @@
+### General ###
+import os
+import warnings
+import numpy as np
+import pandas as pd
+from datetime import datetime,timedelta
+### 插值 ###
+from metpy.interpolate import inverse_distance_to_grid
+### Visualization ###
+import matplotlib.pyplot as plt
+#import netCDF4 as nc
+from matplotlib.font_manager import FontProperties
+from cartopy.mpl.ticker import LongitudeFormatter, LatitudeFormatter
+from cartopy.mpl.gridliner import LONGITUDE_FORMATTER, LATITUDE_FORMATTER
+import matplotlib.ticker as mticker
+import matplotlib as mpl
+import cartopy.crs as ccrs
+import cartopy.feature as cfeat
+#from wrf import getvar, to_np
+import cmaps
+from colorama import Fore
+### Machine Learning ###
+import xgboost as xgb
+from sklearn.metrics import make_scorer
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import KFold, cross_val_score
+from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
+import joblib
+### Optimization ###
+import optuna
+######################
+###functions###
+def get_latest_start_hr(_current_hr):
+    #如果当前是8点-20点之间，ec最新的起报时间是上午8点，如果是20点后，则最新的起报时间是20点
+    if _current_hr > 8 and _current_hr <= 20:
+        _start_hr = '08'
+    if (_current_hr > 20 or _current_hr < 8):
+        _start_hr = '20'
+    return _start_hr
+
+#cressman 插值
+def cressman_interpolate(from_lon, from_lat, from_data, to_lon, to_lat, r):
+    _lon_grid = to_lon
+    _lat_grid = to_lat
+    
+    _lon_gridmesh, _lat_gridmesh = np.meshgrid(_lon_grid, _lat_grid)
+    
+    #插值tm数据
+    #lon,lat, 插值前的经纬度坐标 
+    #lon_gridmesh,lat_gridmesh, 插值后的经纬度坐标
+    #r = 2 搜索半径内的站点数
+    #min_neighbors=3 最小插值点数
+    
+    _grid_data = inverse_distance_to_grid(from_lon, from_lat, from_data
+                                         ,_lon_gridmesh, _lat_gridmesh
+                                         ,r, min_neighbors = 3)
+    return _grid_data
+
+#
+def get_ec_his_date(_date, _hr, _pred_n = 12):
+    #EC起报时间
+    _ec_start_date = _date + timedelta(hours = int(_hr)) + timedelta(hours=-_pred_n)
+    _ec_file_date = _ec_start_date.strftime("%y%m%d%H") + '.0' + str(_pred_n) 
+    #预报的时间
+    _forcast_time = _date + timedelta(hours = int(_hr))
+    return _ec_file_date, _forcast_time.strftime("%Y-%m-%d %H:%M:%S")
+
+def get_ec_pred_date(_date, _hr, _pred_n):
+    _ec_file_date = _date.strftime("%y%m%d") + _hr + '.' + "{:03d}".format(_pred_n)
+    
+    _forcast_time = _date + timedelta(hours = int(_hr)) + timedelta(hours = _pred_n)
+    return _ec_file_date, _forcast_time.strftime("%Y-%m-%d: %H:%M:%S")
+
+### EC文件处理逻辑
+def get_ec_file_info(_ec_file_date, _path):
+    # _date: 起报日期
+    # _hr: 起报时刻
+    # _path: EC文件路径
+    # _pred_n: 预报时效
+    # _job: 当前是预测还是历史数据构建
+    _high_features = ['Q', 'R', 'T', 'uv']
+    # _high_res = 0.25
+    _high_levels = ['850', '700', '500']
+    _sur_features = ['10uv']
+    # _sur_res = 0.125
+
+    _high_feature_path = [_f + '/' + _l + '/' for _f in _high_features for _l in _high_levels]
+    _sur_feature_path = [_f + '/' + '999' + '/' for _f in _sur_features]
+
+#     # 构造EC文件名
+#     # 如果是预测任务，则取当前时间往后预测时效的文件
+#     if _job == 'pred':
+#         _ec_file_date_str = _date.strftime("%y%m%d") + _hr + '.' + "{:03d}".format(_pred_n)
+#      # 如果是历史数据任务，则取前一次预报的12h预报
+#     if _job == 'his':
+#         _pred_n = 12
+#         # 当前日期+起报时间+12小时前
+#         _ec_start_date = _date + timedelta(hours=int(_hr)) + timedelta(hours=-_pred_n)
+#         _ec_file_date_str = _ec_file_date.strftime("%y%m%d%H") + '.0' + str(_pred_n)
+
+    _ec_file_list = [_path + _f + _ec_file_date for _f in _high_feature_path + _sur_feature_path]
+    return _ec_file_list
+
+
+def ec_file_exam(_ec_file):
+    _n = 0
+    while _n < 100:
+        _tmp = pd.read_csv(_ec_file, header=None).iloc[_n][0]
+        if len(_tmp) < 100:
+            _n += 1
+        else:
+            _skiprows = _n
+            _n = 101
+    return _skiprows
+
+def ec_2d_data_to_df(_ec_data, scope={'lon': [116, 128.5], 'lat': [36, 46]}):
+    _ec_data = _ec_data[::-1]
+
+    _ec_data_filt = _ec_data.loc[min(scope['lat']): max(scope['lat']), min(scope['lon']):max(scope['lon'])]
+
+    _ec_data_df = pd.DataFrame(columns=['lon', 'lat', 'value'])
+    _ec_data_df['lon'] = list(_ec_data_filt.columns) * _ec_data_filt.shape[0]
+    _ec_data_df['lat'] = list(np.repeat(_ec_data_filt.index, _ec_data_filt.shape[1]))
+    _ec_data_df['value'] = _ec_data_filt.values.reshape(_ec_data_filt.shape[0] * _ec_data_filt.shape[1], 1)
+
+    return _ec_data_df
+
+
+def get_ec_file_df(_ec_file):
+    _skiprows = ec_file_exam(_ec_file)
+
+    _file_info = pd.read_csv(_ec_file, header=None).iloc[2][0]
+    _file_info_list = _file_info.split(' ')
+
+    _lon_res = float(_file_info_list[0])
+    _lat_res = float(_file_info_list[1])
+    _lon_min = float(_file_info_list[2])
+    _lon_max = float(_file_info_list[3])
+    # lat是倒序
+    _lat_min = float(_file_info_list[5])
+    _lat_max = float(_file_info_list[4])
+
+    # EC文件的经纬度范围及分辨率
+    _ec_file_lon = np.arange(_lon_min, _lon_max + _lon_res, _lon_res)
+    _ec_file_lat = np.arange(_lat_max, _lat_min + _lat_res, _lat_res)
+
+    # EC文件的原始数据
+    _ec_data_origin = pd.read_csv(_ec_file, header=None, skiprows=_skiprows, sep='\s+')
+
+    # 风场数据需要特殊处理
+    _special_features = ['10uv', 'uv']
+    # 当前在处理的物理量
+    _current_f = _ec_file.split('/')[5]
+    if _current_f in _special_features:
+        _ec_data_origin.columns = _ec_file_lon
+        _ec_data_origin.index = np.array(_ec_file_lat.tolist() * 2).flatten()
+
+        # 分别得到EC的U，V风速
+        _ec_df_u = _ec_data_origin.iloc[:len(_ec_file_lat), :]
+        _ec_df_v = _ec_data_origin.iloc[len(_ec_file_lat):, :]
+
+        _ec_u = ec_2d_data_to_df(_ec_df_u)
+        _ec_v = ec_2d_data_to_df(_ec_df_v)
+
+        _ec_wind = pd.merge(_ec_u, _ec_v, left_on=['lon', 'lat'], right_on=['lon', 'lat'], how='inner')
+        _ec_wind['value'] = np.sqrt(_ec_wind['value_x'] ** 2 + _ec_wind['value_y'] ** 2)
+        _ec_df = _ec_wind.loc[:, ['lon', 'lat', 'value']]
+    else:
+        _ec_data_origin.columns = _ec_file_lon
+        _ec_data_origin.index = _ec_file_lat
+        _ec_df = ec_2d_data_to_df(_ec_data_origin)
+
+    return _ec_df
+
+def get_ec_df(_ec_file_list, _forcast_lon, _forcast_lat, _forcast_time):
+    ## _dt: 起报日期
+    ## _hr: 起报时间，['08','20']只可能是这两个数之一
+    _forcast_lon_grid, _forcast_lat_grid = np.meshgrid(_forcast_lon, _forcast_lat)
+    _ec_df = pd.DataFrame({'lon': _forcast_lon_grid.flatten(), 'lat': _forcast_lat_grid.flatten()})
+    for _i in _ec_file_list:
+        _f = _i.split('/')[5] + '_' + _i.split('/')[6]
+        # print('Reading EC file:', _i)
+        _ec_df_origin = get_ec_file_df(_i)
+        _ec_grid = cressman_interpolate(_ec_df_origin['lon'].values, _ec_df_origin['lat'].values,
+                                        _ec_df_origin['value'].values
+                                        , to_lon=_forcast_lon, to_lat=_forcast_lat, r=2)
+        _ec_df[_f] = _ec_grid.flatten()
+    _ec_df.loc[:, 'forcast_time'] = _forcast_time
+    return _ec_df
+    
+#
+### 实况文件处理逻辑
+def get_obs_file(_date, _hr, _path):   
+    _obs_time = (_date + timedelta(hours = int(_hr))).strftime('%Y-%m-%d %H:%M:%S')
+    _file_name = _path + _date.strftime("%Y%m%d") + _hr + '0000.000'
+    print('Reading Observation File:', _file_name)
+    return _file_name, _obs_time
+
+def get_obs_data(_file_name):
+    _obs_data = pd.read_csv(_file_name, header = None, skiprows = 2, sep = '\s+', encoding = "ISO-8859-1")
+    _obs_cols = ['station','lon','lat','hight','level','cloud','wind_direction'
+                ,'wind_speed','pressure','last_3h_pressure','last_weather_1','last_weather_2','last_6h_precipitation'
+                ,'low_cloud_shape','low_cloud_amount','low_cloud_hight','td','visibility','now_weather'
+                ,'temperature','mid_cloud_shape','high_cloud_shape','sigh_1','sigh_2'
+                ,'last_24h_temp_change','last_24h_pressure_change']
+    _obs_data.columns = _obs_cols
+    
+    _obs_data_filt = _obs_data.loc[:,['station','lon','lat','hight','wind_speed']]
+    _obs_data_filt = _obs_data_filt.loc[(_obs_data_filt.wind_speed != 9999.0),:]
+    
+    _file_time = _file_name.split('/')[-1]
+    #_obs_time = pd.to_datetime(_file_time[:8], format='%Y%m%d') + timedelta(hours = int(_file_time[8:10]))
+    
+    return _obs_data_filt
+
+def obs_data_process(_obs_file, _forcast_lon, _forcast_lat, _obs_time):
+    #获取实况原始数据
+    _obs_data = get_obs_data(_obs_file)
+        
+    _forcast_lon_grid, _forcast_lat_grid = np.meshgrid(_forcast_lon, _forcast_lat)    
+    _obs_df = pd.DataFrame({'lon': _forcast_lon_grid.flatten(), 'lat': _forcast_lat_grid.flatten()})
+    
+    #插值
+    _grid_data = cressman_interpolate(_obs_data['lon'].values, _obs_data['lat'].values, _obs_data['wind_speed'].values
+                                     ,to_lon = _forcast_lon, to_lat = _forcast_lat, r = 2)
+
+    _obs_df['wind_speed'] = _grid_data.flatten()
+    _obs_df.loc[:,'obs_time'] = _obs_time
+    return _obs_df
+
+#
+###固定参数部分
+#实况文件路径
+obs_path = '/Users/wudi/Downloads/实况-plot/'
+#EC文件路径
+ec_path = '/Users/wudi/Downloads/ECMWF_HR_2/'
+#需要预报的范围
+forcast_lon = np.arange(116, 128.5 + 0.05, 0.05)
+forcast_lat = np.arange(36, 46 + 0.05, 0.05)
+#预测任务需要预测的时间间隔
+pred_hr = list(range(3,72+3,3)) + list(range(72+6, 240+6,6))
+
+###########################
+#任务1:根据当前时间处理最新的ec和obs数据，并添加到历史数据集中
+his_df = pd.read_csv('/Users/wudi/Downloads/his_df.csv')
+#获取当前时间，拆分日期，小时
+#current_time = datetime.now()
+
+#模拟一个当前的时间
+current_time = datetime(2020,3,19,10,0,0)
+biz_date = datetime(current_time.year, current_time.month, current_time.day)
+current_hr = current_time.hour
+
+#print('读取最新的EC数据日期:', biz_date.strftime('%Y-%m-%d'), '起报时间:', get_latest_start_hr(current_hr))
+
+#用来保存最新的数据
+combine_df_day = pd.DataFrame()
+######读取EC数据######
+#EC起报时间
+start_hr = get_latest_start_hr(current_hr)
+#获取需要读取的ec文件名和对应的预报时间，最新的12h预报
+ec_file_date, forcast_time = get_ec_his_date(biz_date, start_hr)
+print('***当前时间：***', biz_date.strftime('%Y%m%d'), i, '时')
+print('获取EC历史数据：', ec_file_date)
+print('EC文件预报的时间:', forcast_time)
+#过去12h EC预报的风速等变量
+#获取需要读取的EC文件名和预报的时间
+ec_file_list = get_ec_file_info(ec_file_date, _path = ec_path)
+ec_df = get_ec_df(ec_file_list, forcast_lon, forcast_lat, forcast_time)
+
+######读取实况数据######
+obs_file_name, obs_time = get_obs_file(_date = biz_date, _hr = start_hr, _path = obs_path)
+print('实况时间：', obs_time)
+print('实况数据文件名：', obs_file_name)
+#实况数据处理-插值，并返回dataframe
+obs_df = obs_data_process(obs_file_name, forcast_lon, forcast_lat, obs_time)
+
+#将读取的EC数据和实况数据合并
+combine_df_hr = pd.merge(obs_df, ec_df, left_on = ['lon', 'lat', 'obs_time'], right_on = ['lon', 'lat', 'forcast_time'], how = 'inner')
+combine_df_day = pd.concat([combine_df_day, combine_df_hr], axis = 0)
+
+#将最新的数据合并到历史数据集中，任务完成
+his_df = pd.concat([his_df, combine_df_day], axis = 0)
+
+#his_df.to_csv('/Users/wudi/Downloads/his_df.csv', index=False)
+print('数据处理完成')
+
+#任务2:根据当前时间，处理未来需要预报的EC文件，形成新的预测集
+pred_df = pd.DataFrame()
+for hr in pred_hr[0:1]:
+    pred_ec_file_date, pred_forcast_time = get_ec_pred_date(biz_date, start_hr, hr)
+    pred_ec_file_list = get_ec_file_info(pred_ec_file_date, ec_path)
+    pred_ec_df = get_ec_df(pred_ec_file_list, forcast_lon, forcast_lat, pred_forcast_time)
+    
+    pred_df = pd.concat([pred_df, pred_ec_df], axis = 0)
+
+xgb_model_file = '/Users/wudi/Downloads/xgb_model.dat'
+xgb_model = joblib.load(xgb_model_file)
+xgb_model.objective = 'reg:squarederror'
+
+pred_res = xgb_model.predict(xgb.DMatrix(pred_df.drop(['forcast_time'],axis=1)))
+pred_df.loc[:,'pred'] = pred_res
